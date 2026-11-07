@@ -1,6 +1,6 @@
 {
   "name": "download-tool-box",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "每一次下载，都是一次美好的开始：今天你下载了么？",
   "main": "./out/main/index.js",
   "author": "example.com",

@@ -12,8 +12,6 @@ let selectedListFile = null
 let currentLogFile = ""
 let currentSessionDir = ""
 
-const ALLOWED_THREADS = new Set([1, 2, 4, 8, 16, 32, 64])
-
 function getAppDataDir () {
   const dir = path.join(path.dirname(app.getPath("exe")), "DownloaderData")
   if(!app.isPackaged) return path.join(app.getAppPath(), "runtime")
@@ -227,10 +225,10 @@ function parseJsonLines (buffer, streamType) {
   }
 }
 
-ipcMain.handle("download:start", async (_event, threadCount) => {
+ipcMain.handle("download:start", async () => {
   if(downloader) throw new Error("下载任务已经在运行。")
 
-  const threads = ALLOWED_THREADS.has(threadCount) ? threadCount : 64
+  const threads = 64
   const dataDir = getAppDataDir()
   const listFile = selectedListFile || path.join(dataDir, "download.txt")
   const saveDir = currentSessionDir || path.join(dataDir, "downloads")

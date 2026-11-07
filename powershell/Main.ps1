@@ -44,7 +44,7 @@ try {
 
     $queue = [System.Collections.Generic.Queue[object]]::new()
     $pending = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    $retryCount = @{}
+    $deferred = [System.Collections.Generic.List[object]]::new()
     $commentMap = @{}
     $displayMap = @{}
     $resolvedFileMap = @{}
@@ -63,7 +63,6 @@ try {
                 $queue.Enqueue($url)
                 $commentMap[$url] = $item.CommentLine
                 $displayMap[$url] = if ($item.DisplayName) { $item.DisplayName } else { $url }
-                $retryCount[$url] = 0
                 $total++
             }
         } catch {
@@ -82,45 +81,91 @@ try {
         if ($filePercent -gt 100) { $filePercent = 100 }
         Send-UiEvent -Type "file-progress" -Message "文件下载进度" -Data @{ percent = $filePercent }
     }
-    while ($queue.Count -gt 0) {
-        $url = $queue.Dequeue()
-        [void]$pending.Remove($url)
-        $displayName = $displayMap[$url]
-        $urlFileName = Get-DownloadFileName -Url $url
-        $startDisplayName = if ([string]::IsNullOrWhiteSpace($urlFileName)) { $displayName } else { Get-SafeFileName -Name $urlFileName }
-        Send-UiEvent -Type "log" -Message "开始下载：$startDisplayName"
-        Send-UiEvent -Type "file-progress" -Message "文件下载进度" -Data @{ percent = 0; current = $startDisplayName }
-        $downloadTempPath = Join-Path $config.TempDir ([guid]::NewGuid().ToString("N") + ".download")
-        $result = Invoke-HttpDownload -Url $url -Destination $downloadTempPath -TimeoutSeconds $config.TimeoutSeconds -BufferSize $config.BufferSize -ThreadCount $config.ThreadCount -OnProgress $progressCallback
+    while ($queue.Count -gt 0 -or $deferred.Count -gt 0) {
+        if ($queue.Count -eq 0) {
+            # ---------- 延迟重试阶段：主队列已全部处理完成 ----------
+            $deferredItem = $deferred[0]
+            $deferred.RemoveAt(0)
+            $url = $deferredItem.Url
+            $displayName = $displayMap[$url]
+            $attempt = [int]$deferredItem.Attempt + 1
+            $urlFileName = Get-DownloadFileName -Url $url
+            $startDisplayName = if ([string]::IsNullOrWhiteSpace($urlFileName)) { $displayName } else { Get-SafeFileName -Name $urlFileName }
 
-        if ($result.Success) {
-            $name = Get-DownloadFileName -Url $url -ContentDisposition $result.ContentDisposition -FinalUrl $result.FinalUrl
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = "download-$([guid]::NewGuid().ToString('N')).bin" }
-            $name = Get-SafeFileName -Name $name
-            if ($resolvedFileMap.ContainsKey($url)) { $name = $resolvedFileMap[$url] } else { $resolvedFileMap[$url] = $name }
-            Move-Item -LiteralPath $downloadTempPath -Destination (Join-Path $config.SaveDir $name) -Force
-            $successCount++
-            Write-DownloadLog -Path $config.LogFile -Status "SUCCESS" -FileName $name -Message "下载完成，大小：$($result.Size) bytes"
-        } else {
-            if ($result.IsNetwork) {
-                $action = "Retry"
-            } else {
-                $retryCount[$url]++
-                $action = Get-RetryAction -IsNetwork $false -RetryCount $retryCount[$url] -MaxNonNetworkRetries $config.MaxNonNetworkRetries
-            }
+            Send-UiEvent -Type "log" -Message "延迟重试（第 $attempt/$($config.MaxNonNetworkRetries) 次）：$startDisplayName（1 线程）"
+            Send-UiEvent -Type "file-progress" -Message "文件下载进度" -Data @{ percent = 0; current = $startDisplayName }
+            $downloadTempPath = Join-Path $config.TempDir ([guid]::NewGuid().ToString("N") + ".download")
+            $result = Invoke-HttpDownload -Url $url -Destination $downloadTempPath -TimeoutSeconds $config.TimeoutSeconds -BufferSize $config.BufferSize -ThreadCount 1 -OnProgress $progressCallback
 
-            if ($action -eq "Retry") {
+            if ($result.Success) {
+                $name = Get-DownloadFileName -Url $url -ContentDisposition $result.ContentDisposition -FinalUrl $result.FinalUrl
+                if ([string]::IsNullOrWhiteSpace($name)) { $name = "download-$([guid]::NewGuid().ToString('N')).bin" }
+                $name = Get-SafeFileName -Name $name
+                if ($resolvedFileMap.ContainsKey($url)) { $name = $resolvedFileMap[$url] } else { $resolvedFileMap[$url] = $name }
+                Move-Item -LiteralPath $downloadTempPath -Destination (Join-Path $config.SaveDir $name) -Force
+                $successCount++
+                Write-DownloadLog -Path $config.LogFile -Status "SUCCESS" -FileName $name -Message "延迟重试成功，大小：$($result.Size) bytes"
+            } elseif ($attempt -lt $config.MaxNonNetworkRetries) {
                 Start-Sleep -Seconds $config.RetryDelaySeconds
-                if ($pending.Add($url)) { $queue.Enqueue($url) }
-                Write-DownloadLog -Path $config.LogFile -Status "RETRY" -FileName $displayName -Message "第 $($retryCount[$url]) 次重试；$($result.Error)"
+                $deferred.Add([pscustomobject]@{ Url = $url; Attempt = $attempt })
+                Write-DownloadLog -Path $config.LogFile -Status "RETRY" -FileName $startDisplayName -Message "第 $attempt 次延迟重试失败，继续重试；$($result.Error)"
             } else {
                 $failedCount++
                 if ($manualSet.Add($url)) {
                     Add-ManualProcessItem -Path $config.ManualProcessFile -Url $url -CommentLine $commentMap[$url] -Reason $result.Error
                     $manualCount++
                 }
-                Write-DownloadLog -Path $config.LogFile -Status "ERROR" -FileName $displayName -Message "达到最大重试次数，加入手动处理清单；$($result.Error)"
+                Write-DownloadLog -Path $config.LogFile -Status "ERROR" -FileName $startDisplayName -Message "达到最大重试次数，加入手动处理清单；$($result.Error)"
             }
+
+            Send-UiEvent -Type "progress" -Message "下载进度更新" -Data @{
+                current = $displayName
+                success = $successCount
+                failed = $failedCount
+                pending = $queue.Count
+            }
+            continue
+        }
+
+        # ---------- 主队列阶段 ----------
+        $url = $queue.Dequeue()
+        [void]$pending.Remove($url)
+        $displayName = $displayMap[$url]
+        $urlFileName = Get-DownloadFileName -Url $url
+        $startDisplayName = if ([string]::IsNullOrWhiteSpace($urlFileName)) { $displayName } else { Get-SafeFileName -Name $urlFileName }
+        $threads = [int]$config.ThreadCount
+        Send-UiEvent -Type "log" -Message "开始下载：$startDisplayName（$threads 线程）"
+        Send-UiEvent -Type "file-progress" -Message "文件下载进度" -Data @{ percent = 0; current = $startDisplayName }
+
+        while ($true) {
+            $downloadTempPath = Join-Path $config.TempDir ([guid]::NewGuid().ToString("N") + ".download")
+            $result = Invoke-HttpDownload -Url $url -Destination $downloadTempPath -TimeoutSeconds $config.TimeoutSeconds -BufferSize $config.BufferSize -ThreadCount $threads -OnProgress $progressCallback
+
+            if ($result.Success) {
+                $name = Get-DownloadFileName -Url $url -ContentDisposition $result.ContentDisposition -FinalUrl $result.FinalUrl
+                if ([string]::IsNullOrWhiteSpace($name)) { $name = "download-$([guid]::NewGuid().ToString('N')).bin" }
+                $name = Get-SafeFileName -Name $name
+                if ($resolvedFileMap.ContainsKey($url)) { $name = $resolvedFileMap[$url] } else { $resolvedFileMap[$url] = $name }
+                Move-Item -LiteralPath $downloadTempPath -Destination (Join-Path $config.SaveDir $name) -Force
+                $successCount++
+                Write-DownloadLog -Path $config.LogFile -Status "SUCCESS" -FileName $name -Message "下载完成，大小：$($result.Size) bytes"
+                break
+            }
+
+            $reasonLabel = if ($result.IsNetwork) { "网络原因失败" } else { "非网络原因失败" }
+
+            if ($threads -gt 1) {
+                $nextThreads = Get-NextThreadCount -Current $threads
+                Write-DownloadLog -Path $config.LogFile -Status "THREAD" -FileName $startDisplayName -Message "$reasonLabel：$($result.Error)；线程数 $threads → $nextThreads"
+                $threads = $nextThreads
+                Write-DownloadLog -Path $config.LogFile -Status "RETRY" -FileName $startDisplayName -Message "使用 $threads 线程重新下载"
+                Send-UiEvent -Type "file-progress" -Message "文件下载进度" -Data @{ percent = 0; current = $startDisplayName }
+                continue
+            }
+
+            $deferred.Add([pscustomobject]@{ Url = $url; Attempt = 0 })
+            Write-DownloadLog -Path $config.LogFile -Status "RETRY" -FileName $displayName -Message "$reasonLabel，1 线程仍失败：$($result.Error)；等待主队列完成后进行延迟重试"
+            break
         }
 
         Send-UiEvent -Type "progress" -Message "下载进度更新" -Data @{

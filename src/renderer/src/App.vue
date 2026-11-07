@@ -19,7 +19,7 @@
           <el-select
             v-model="threadCount"
             class="thread-select"
-            :disabled="running">
+            disabled>
             <el-option
               v-for="count in threadOptions"
               :key="count"
@@ -277,7 +277,7 @@ function log(message) {
 
 async function start() {
   try {
-    await window.downloader.start(threadCount.value)
+    await window.downloader.start(64)
   } catch (error) {
     log(`启动失败：${String(error)}`)
   }
